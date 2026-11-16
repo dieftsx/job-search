@@ -2,7 +2,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Db, Job, Profile, emptyProfile } from "./types";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// Na Vercel só /tmp aceita escrita (e é apagado de tempos em tempos):
+// serve para demonstração, não para guardar dados.
+const DATA_DIR = process.env.VERCEL
+  ? "/tmp/vagas-auto"
+  : path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
 // Fila simples para evitar gravações concorrentes no arquivo.
