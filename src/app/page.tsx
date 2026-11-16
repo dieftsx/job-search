@@ -1,33 +1,48 @@
 "use client";
 
+import { signOut, type User } from "firebase/auth";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import type { Job, JobStatus, Profile } from "@/lib/types";
+import SetupNotice from "@/components/SetupNotice";
+import { useAuth } from "@/lib/auth-context";
+import * as db from "@/lib/db";
+import { fb, firebaseConfigured } from "@/lib/firebase";
+import type { Analysis, Job, JobStatus, Profile } from "@/lib/types";
 import { emptyProfile } from "@/lib/types";
 
 type Tab = JobStatus | "all";
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "ready", label: "Prontas para inscrição" },
+  { id: "ready", label: "Prontas" },
   { id: "new", label: "Novas" },
-  { id: "low", label: "Baixa compatibilidade" },
+  { id: "low", label: "Nota baixa" },
   { id: "applied", label: "Inscritas" },
   { id: "dismissed", label: "Descartadas" },
   { id: "all", label: "Todas" },
 ];
 
-async function api<T>(url: string, init?: RequestInit): Promise<T> {
+/** Chama uma rota da API enviando o token de login do Firebase. */
+async function api<T>(user: User, url: string, body: unknown): Promise<T> {
+  const token = await user.getIdToken();
   const res = await fetch(url, {
-    ...init,
-    headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
   });
-  const body = (await res.json()) as T & { error?: string };
-  if (!res.ok) throw new Error(body.error ?? `Erro ${res.status}`);
-  return body;
+  const data = (await res.json()) as T & { error?: string };
+  if (!res.ok) throw new Error(data.error ?? `Erro ${res.status}`);
+  return data;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export default function Home() {
+  const router = useRouter();
+  const { user, loading } = useAuth();
+
   const [profile, setProfile] = useState<Profile>(emptyProfile);
   const [keywordsText, setKeywordsText] = useState("");
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -35,38 +50,64 @@ export default function Home() {
   const [open, setOpen] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [isError, setIsError] = useState(false);
 
-  const loadJobs = useCallback(async () => {
-    setJobs(await api<Job[]>("/api/jobs"));
+  const say = useCallback((text: string, error = false) => {
+    setNotice(text);
+    setIsError(error);
   }, []);
 
   useEffect(() => {
+    if (!loading && !user && firebaseConfigured) router.replace("/login");
+  }, [loading, user, router]);
+
+  useEffect(() => {
+    if (!user) return;
     (async () => {
       try {
-        const p = await api<Profile>("/api/profile");
+        const p = await db.getProfile(user.uid);
+        if (!p.name && user.displayName) p.name = user.displayName;
         setProfile(p);
         setKeywordsText(p.keywords.join(", "));
-        await loadJobs();
+        setJobs(await db.listJobs(user.uid));
       } catch (e) {
-        setNotice(String(e));
+        say(e instanceof Error ? e.message : String(e), true);
       }
     })();
-  }, [loadJobs]);
+  }, [user, say]);
 
-  function replaceJob(job: Job) {
-    setJobs((list) => list.map((j) => (j.id === job.id ? job : j)));
+  if (!firebaseConfigured) return <SetupNotice />;
+  if (loading || !user) {
+    return (
+      <main className="auth">
+        <p className="center pixel">
+          LOADING<span className="blink">...</span>
+        </p>
+      </main>
+    );
+  }
+  const me = user;
+
+  function replaceJob(id: string, patch: Partial<Job>) {
+    setJobs((list) => list.map((j) => (j.id === id ? { ...j, ...patch } : j)));
+  }
+
+  function currentProfile(): Profile {
+    return {
+      ...profile,
+      keywords: keywordsText
+        .split(/[,\n]/)
+        .map((k) => k.trim())
+        .filter(Boolean),
+      minScore: Math.max(0, Math.min(100, Number(profile.minScore) || 0)),
+    };
   }
 
   async function saveProfile(): Promise<Profile> {
-    const saved = await api<Profile>("/api/profile", {
-      method: "PUT",
-      body: JSON.stringify({
-        ...profile,
-        keywords: keywordsText.split(/[,\n]/),
-      }),
-    });
-    setProfile(saved);
-    return saved;
+    const p = currentProfile();
+    await db.saveProfile(me.uid, p);
+    setProfile(p);
+    return p;
   }
 
   /** Executa uma ação mostrando erros no aviso e bloqueando os botões. */
@@ -75,84 +116,84 @@ export default function Home() {
     try {
       await fn();
     } catch (e) {
-      setNotice(e instanceof Error ? e.message : String(e));
+      say(e instanceof Error ? e.message : String(e), true);
     } finally {
       setBusy(false);
     }
   }
 
-  async function analyze(id: string) {
-    replaceJob(await api<Job>(`/api/jobs/${id}/analyze`, { method: "POST" }));
+  async function analyze(job: Job, p: Profile) {
+    const analysis = await api<Analysis>(me, "/api/analyze", {
+      profile: { name: p.name, resume: p.resume },
+      job,
+    });
+    const status: JobStatus = analysis.score >= p.minScore ? "ready" : "low";
+    await db.updateJob(me.uid, job.id, { analysis, status });
+    replaceJob(job.id, { analysis, status });
   }
 
   /** Fluxo automático: salva o perfil, busca e analisa todas as vagas novas. */
   const runAll = () =>
     run(async () => {
-      await saveProfile();
-      setNotice("Buscando vagas na Gupy...");
-      const r = await api<{ found: number; added: number; errors: string[] }>(
+      const p = await saveProfile();
+      say("Buscando vagas na Gupy...");
+      const r = await api<{ jobs: Job[]; errors: string[] }>(
+        me,
         "/api/search",
-        { method: "POST" },
+        { keywords: p.keywords, remoteOnly: p.remoteOnly, state: p.state },
       );
-      const list = await api<Job[]>("/api/jobs");
+      const known = new Set(jobs.map((j) => j.id));
+      const added = await db.addJobs(me.uid, r.jobs, known);
+      const list = await db.listJobs(me.uid);
       setJobs(list);
 
       const pending = list.filter((j) => j.status === "new");
       let done = 0;
       let failed = 0;
       for (const job of pending) {
-        setNotice(`Analisando ${done + failed + 1} de ${pending.length}...`);
+        say(`Analisando ${done + failed + 1} de ${pending.length}...`);
         try {
-          await analyze(job.id);
+          await analyze(job, p);
           done++;
         } catch (e) {
           failed++;
-          // Sem chave ou sem currículo: não adianta continuar.
-          if (/GEMINI_API_KEY|currículo/.test(String(e))) throw e;
+          // Sem chave, sem currículo ou sem login: não adianta continuar.
+          if (/GEMINI_API_KEY|currículo|login|Sessão/.test(String(e))) throw e;
         }
         await sleep(4000); // respeita o limite do plano gratuito do Gemini
       }
-      await loadJobs();
+      setJobs(await db.listJobs(me.uid));
       setTab("ready");
-      setNotice(
-        `${r.found} vagas encontradas, ${r.added} inéditas, ${done} analisadas` +
+      say(
+        `${r.jobs.length} vagas encontradas, ${added} inéditas, ${done} analisadas` +
           (failed ? `, ${failed} com falha na análise` : "") +
           (r.errors.length ? `. Erros na busca: ${r.errors.join("; ")}` : "."),
+        r.errors.length > 0,
       );
     });
 
   const setStatus = (id: string, status: JobStatus) =>
     run(async () => {
-      replaceJob(
-        await api<Job>(`/api/jobs/${id}`, {
-          method: "PATCH",
-          body: JSON.stringify({ status }),
-        }),
-      );
+      const patch: Partial<Job> = { status };
+      if (status === "applied") patch.appliedAt = new Date().toISOString();
+      await db.updateJob(me.uid, id, patch);
+      replaceJob(id, patch);
     });
 
   const saveTexts = (job: Job) =>
     run(async () => {
-      replaceJob(
-        await api<Job>(`/api/jobs/${job.id}`, {
-          method: "PATCH",
-          body: JSON.stringify({
-            coverLetter: job.analysis?.coverLetter,
-            pitch: job.analysis?.pitch,
-          }),
-        }),
-      );
-      setNotice("Textos salvos.");
+      if (!job.analysis) return;
+      await db.updateJob(me.uid, job.id, { analysis: job.analysis });
+      say("Textos salvos.");
     });
 
   const apply = (job: Job) =>
     run(async () => {
-      setNotice("Abrindo a vaga no navegador...");
-      const r = await api<{ clickedApply: boolean }>(
-        `/api/jobs/${job.id}/apply`,
-        { method: "POST" },
-      );
-      setNotice(
+      say("Abrindo a vaga no navegador...");
+      const r = await api<{ clickedApply: boolean }>(me, "/api/apply", {
+        url: job.url,
+      });
+      say(
         r.clickedApply
           ? "Candidatura aberta. Revise, cole os textos e envie na janela do navegador; depois marque como inscrita."
           : "Vaga aberta, mas não achei o botão de candidatura. Continue manualmente na janela do navegador.",
@@ -161,12 +202,12 @@ export default function Home() {
 
   async function copy(text: string) {
     await navigator.clipboard.writeText(text);
-    setNotice("Copiado.");
+    say("Copiado.");
   }
 
   function editText(job: Job, field: "coverLetter" | "pitch", value: string) {
     if (!job.analysis) return;
-    replaceJob({ ...job, analysis: { ...job.analysis, [field]: value } });
+    replaceJob(job.id, { analysis: { ...job.analysis, [field]: value } });
   }
 
   const visible = jobs.filter((j) => tab === "all" || j.status === tab);
@@ -175,35 +216,48 @@ export default function Home() {
 
   return (
     <main>
-      <h1>Vagas Auto</h1>
-      <div className="muted">
-        Busca vagas na Gupy, pontua contra o seu currículo e prepara a
-        inscrição para você revisar e enviar.
-      </div>
+      <header className="topbar">
+        <div>
+          <h1>VAGAS AUTO</h1>
+          <div className="muted">
+            Caça vagas na Gupy e calcula seu nível de compatibilidade
+            <span className="blink"> _</span>
+          </div>
+        </div>
+        <div className="row">
+          <span className="small muted">{me.email}</span>
+          <button className="danger" onClick={() => void signOut(fb().auth)}>
+            Sair
+          </button>
+        </div>
+      </header>
 
       <section className="panel">
-        <h2>Perfil</h2>
+        <h2>Player 1: perfil</h2>
         <div className="grid">
           <div>
-            <label>Nome</label>
+            <label htmlFor="name">Nome</label>
             <input
+              id="name"
               type="text"
               value={profile.name}
               onChange={(e) => setProfile({ ...profile, name: e.target.value })}
             />
           </div>
           <div>
-            <label>Termos de busca (separados por vírgula)</label>
+            <label htmlFor="keywords">Termos de busca (com vírgula)</label>
             <input
+              id="keywords"
               type="text"
-              placeholder="fotógrafo, social media, editor de vídeo"
+              placeholder="front-end, react, designer"
               value={keywordsText}
               onChange={(e) => setKeywordsText(e.target.value)}
             />
           </div>
           <div>
-            <label>Estado (nome completo, vazio = todos)</label>
+            <label htmlFor="state">Estado (vazio = todos)</label>
             <input
+              id="state"
               type="text"
               placeholder="Rondônia"
               value={profile.state}
@@ -213,8 +267,9 @@ export default function Home() {
             />
           </div>
           <div>
-            <label>Nota mínima para inscrição (0 a 100)</label>
+            <label htmlFor="minScore">Nota mínima (0 a 100)</label>
             <input
+              id="minScore"
               type="number"
               min={0}
               max={100}
@@ -225,7 +280,7 @@ export default function Home() {
             />
           </div>
         </div>
-        <div style={{ marginTop: 12 }}>
+        <div style={{ marginTop: 16 }}>
           <label className="check">
             <input
               type="checkbox"
@@ -237,49 +292,53 @@ export default function Home() {
             Somente vagas remotas
           </label>
         </div>
-        <div style={{ marginTop: 12 }}>
-          <label>Currículo (cole o texto completo)</label>
+        <div style={{ marginTop: 16 }}>
+          <label htmlFor="resume">Currículo (cole o texto completo)</label>
           <textarea
+            id="resume"
             rows={8}
             value={profile.resume}
             onChange={(e) => setProfile({ ...profile, resume: e.target.value })}
           />
         </div>
-        <div className="row" style={{ marginTop: 12 }}>
+        <div className="row" style={{ marginTop: 16 }}>
           <button className="primary" disabled={busy} onClick={runAll}>
-            Buscar e analisar vagas
+            ▶ Buscar e analisar
           </button>
           <button
             disabled={busy}
             onClick={() =>
               run(async () => {
                 await saveProfile();
-                setNotice("Perfil salvo.");
+                say("Perfil salvo.");
               })
             }
           >
             Salvar perfil
           </button>
         </div>
-        {notice && <div className="notice">{notice}</div>}
+        {notice && (
+          <div className={`notice ${isError ? "error" : ""}`}>{notice}</div>
+        )}
       </section>
 
       <section className="panel">
-        <div className="row" style={{ marginBottom: 8 }}>
+        <h2>Missões: vagas</h2>
+        <div className="row">
           {TABS.map((t) => (
             <button
               key={t.id}
               className={`tab ${tab === t.id ? "active" : ""}`}
               onClick={() => setTab(t.id)}
             >
-              {t.label} ({count(t.id)})
+              {t.label} {count(t.id)}
             </button>
           ))}
         </div>
 
         {visible.length === 0 && (
-          <div className="muted" style={{ padding: "12px 0" }}>
-            Nenhuma vaga aqui ainda.
+          <div className="muted" style={{ paddingTop: 18 }}>
+            Nenhuma vaga nesta fase ainda.
           </div>
         )}
 
@@ -309,17 +368,22 @@ export default function Home() {
                   </div>
                   {a && <div className="small">{a.summary}</div>}
                 </div>
-                <div className={`score ${cls}`}>{a ? a.score : "–"}</div>
+                <div className={`score ${cls}`}>
+                  <strong>{a ? a.score : "??"}</strong>
+                  <div className="bar">
+                    <span style={{ width: `${a ? a.score : 0}%` }} />
+                  </div>
+                </div>
               </div>
 
-              <div className="row" style={{ marginTop: 10 }}>
+              <div className="row" style={{ marginTop: 12 }}>
                 <button onClick={() => setOpen(isOpen ? null : job.id)}>
                   {isOpen ? "Fechar" : "Revisar"}
                 </button>
                 {!a && (
                   <button
                     disabled={busy}
-                    onClick={() => run(() => analyze(job.id))}
+                    onClick={() => run(() => analyze(job, currentProfile()))}
                   >
                     Analisar
                   </button>
@@ -338,7 +402,7 @@ export default function Home() {
                     disabled={busy}
                     onClick={() => setStatus(job.id, "applied")}
                   >
-                    Marcar como inscrita
+                    Marcar inscrita
                   </button>
                 )}
                 {job.status !== "dismissed" && job.status !== "applied" && (
@@ -378,8 +442,11 @@ export default function Home() {
                         </div>
                       </div>
                       <div>
-                        <label>Carta de apresentação</label>
+                        <label htmlFor={`cl-${job.id}`}>
+                          Carta de apresentação
+                        </label>
                         <textarea
+                          id={`cl-${job.id}`}
                           rows={9}
                           value={a.coverLetter}
                           onChange={(e) =>
@@ -388,8 +455,11 @@ export default function Home() {
                         />
                       </div>
                       <div>
-                        <label>Por que quero esta vaga</label>
+                        <label htmlFor={`pt-${job.id}`}>
+                          Por que quero esta vaga
+                        </label>
                         <textarea
+                          id={`pt-${job.id}`}
                           rows={4}
                           value={a.pitch}
                           onChange={(e) =>
@@ -409,7 +479,9 @@ export default function Home() {
                         </button>
                         <button
                           disabled={busy}
-                          onClick={() => run(() => analyze(job.id))}
+                          onClick={() =>
+                            run(() => analyze(job, currentProfile()))
+                          }
                         >
                           Gerar de novo
                         </button>

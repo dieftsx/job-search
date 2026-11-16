@@ -44,11 +44,6 @@ export interface Profile {
   minScore: number;
 }
 
-export interface Db {
-  profile: Profile;
-  jobs: Job[];
-}
-
 export const emptyProfile: Profile = {
   name: "",
   resume: "",
